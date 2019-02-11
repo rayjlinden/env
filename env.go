@@ -4,6 +4,7 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"reflect"
 	"strconv"
@@ -31,6 +32,7 @@ var (
 	sliceOfFloat32s  = reflect.TypeOf([]float32(nil))
 	sliceOfFloat64s  = reflect.TypeOf([]float64(nil))
 	sliceOfDurations = reflect.TypeOf([]time.Duration(nil))
+	sliceOfURLs      = reflect.TypeOf([]url.URL(nil))
 )
 
 // CustomParsers is a friendly name for the type that `ParseWithFuncs()` accepts
@@ -42,20 +44,24 @@ type ParserFunc func(v string) (interface{}, error)
 // Parse parses a struct containing `env` tags and loads its values from
 // environment variables.
 func Parse(v interface{}) error {
-	ptrRef := reflect.ValueOf(v)
-	if ptrRef.Kind() != reflect.Ptr {
-		return ErrNotAStructPtr
-	}
-	ref := ptrRef.Elem()
-	if ref.Kind() != reflect.Struct {
-		return ErrNotAStructPtr
-	}
-	return doParse(ref, make(map[reflect.Type]ParserFunc, 0))
+	return ParseWithPrefixFuncs(v, "", make(map[reflect.Type]ParserFunc, 0))
+}
+
+// ParseWithPrefix parses a struct containing `env` tags and loads its values from
+// environment variables.  The actual env vars looked up include the passed in prefix.
+func ParseWithPrefix(v interface{}, prefix string) error {
+	return ParseWithPrefixFuncs(v, prefix, make(map[reflect.Type]ParserFunc, 0))
 }
 
 // ParseWithFuncs is the same as `Parse` except it also allows the user to pass
 // in custom parsers.
 func ParseWithFuncs(v interface{}, funcMap CustomParsers) error {
+	return ParseWithPrefixFuncs(v, "", funcMap)
+}
+
+// ParseWithPrefixFuncs is the same as `ParseWithPrefix` except it also allows the user to pass
+// in custom parsers.
+func ParseWithPrefixFuncs(v interface{}, prefix string, funcMap CustomParsers) error {
 	ptrRef := reflect.ValueOf(v)
 	if ptrRef.Kind() != reflect.Ptr {
 		return ErrNotAStructPtr
@@ -64,10 +70,10 @@ func ParseWithFuncs(v interface{}, funcMap CustomParsers) error {
 	if ref.Kind() != reflect.Struct {
 		return ErrNotAStructPtr
 	}
-	return doParse(ref, funcMap)
+	return doParse(ref, prefix, funcMap)
 }
 
-func doParse(ref reflect.Value, funcMap CustomParsers) error {
+func doParse(ref reflect.Value, prefix string, funcMap CustomParsers) error {
 	refType := ref.Type()
 	var errorList []string
 
@@ -81,7 +87,7 @@ func doParse(ref reflect.Value, funcMap CustomParsers) error {
 			continue
 		}
 		refTypeField := refType.Field(i)
-		value, err := get(refTypeField)
+		value, err := get(refTypeField, prefix)
 		if err != nil {
 			errorList = append(errorList, err.Error())
 			continue
@@ -103,7 +109,7 @@ func doParse(ref reflect.Value, funcMap CustomParsers) error {
 	return errors.New(strings.Join(errorList, ". "))
 }
 
-func get(field reflect.StructField) (string, error) {
+func get(field reflect.StructField, prefix string) (string, error) {
 	var (
 		val string
 		err error
@@ -112,7 +118,7 @@ func get(field reflect.StructField) (string, error) {
 	key, opts := parseKeyForOption(field.Tag.Get("env"))
 
 	defaultValue := field.Tag.Get("envDefault")
-	val = getOr(key, defaultValue)
+	val = getOrWithPrefix(key, prefix, defaultValue)
 
 	expandVar := field.Tag.Get("envExpand")
 	if strings.ToLower(expandVar) == "true" {
@@ -149,8 +155,8 @@ func getRequired(key string) (string, error) {
 	return "", fmt.Errorf("required environment variable %q is not set", key)
 }
 
-func getOr(key, defaultValue string) string {
-	value, ok := os.LookupEnv(key)
+func getOrWithPrefix(key, prefix, defaultValue string) string {
+	value, ok := os.LookupEnv(prefix + key)
 	if ok {
 		return value
 	}
@@ -167,6 +173,14 @@ func set(field reflect.Value, refType reflect.StructField, value string, funcMap
 		}
 		field.Set(reflect.ValueOf(val))
 		return nil
+	}
+
+	if refType.Type == reflect.TypeOf(url.URL{}) {
+		u, err := url.Parse(value)
+		if err != nil {
+			return fmt.Errorf("Unable to complete URL parse: %v", err)
+		}
+		field.Set(reflect.ValueOf(*u))
 	}
 
 	// fall back to built-in parsers
@@ -284,6 +298,12 @@ func handleSlice(field reflect.Value, value, separator string) error {
 			return err
 		}
 		field.Set(reflect.ValueOf(durationData))
+	case sliceOfURLs:
+		urlData, err := parseUrls(splitData)
+		if err != nil {
+			return err
+		}
+		field.Set(reflect.ValueOf(urlData))
 	default:
 		elemType := field.Type().Elem()
 		// Ensure we test *type as we can always address elements in a slice.
@@ -407,6 +427,20 @@ func parseDurations(data []string) ([]time.Duration, error) {
 		durationSlice = append(durationSlice, dvalue)
 	}
 	return durationSlice, nil
+}
+
+func parseUrls(data []string) ([]url.URL, error) {
+	urlSlice := make([]url.URL, 0, len(data))
+
+	for _, v := range data {
+		uvalue, err := url.Parse(v)
+		if err != nil {
+			return nil, err
+		}
+
+		urlSlice = append(urlSlice, *uvalue)
+	}
+	return urlSlice, nil
 }
 
 func parseTextUnmarshalers(field reflect.Value, data []string) error {
